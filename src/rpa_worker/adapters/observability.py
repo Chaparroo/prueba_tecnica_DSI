@@ -156,9 +156,18 @@ class Telemetry:
 
 
 def configure_telemetry(
-    *, service_name: str, otlp_endpoint: str | None, metrics_interval_seconds: float
+    *,
+    service_name: str,
+    otlp_endpoint: str | None,
+    metrics_interval_seconds: float,
+    instance_id: str | None = None,
 ) -> Telemetry:
-    resource = Resource.create({"service.name": service_name})
+    # service.instance.id estable (nombre del consumer): si no, el SDK genera uno
+    # aleatorio por arranque y cada reinicio crea series nuevas en Prometheus.
+    attrs = {"service.name": service_name}
+    if instance_id:
+        attrs["service.instance.id"] = instance_id
+    resource = Resource.create(attrs)
     # El TracerProvider del SDK se instala siempre: genera trace_id/span_id
     # reales para los logs y el traceparent aunque no haya collector.
     tracer_provider = TracerProvider(resource=resource)
@@ -179,6 +188,15 @@ def configure_telemetry(
 
 
 _CIRCUIT_VALUE = {CircuitState.CLOSED: 0, CircuitState.HALF_OPEN: 1, CircuitState.OPEN: 2}
+
+# Categorías de alerta = motivos de DLQ que alertan (ver observability/prometheus).
+ALERT_CATEGORIES = ("auth", "contract", "poison", "max_deliveries", "max_age")
+
+
+def alert_category(kind: AlertKind, reason: str) -> str:
+    if kind is AlertKind.POISON and reason == "max_deliveries":
+        return "max_deliveries"
+    return str(kind)  # poison restante = mensajes ilegibles
 
 
 class OtelMetrics:
@@ -201,6 +219,10 @@ class OtelMetrics:
         self._alerts = m.create_counter(
             "rpa.alerts", unit="{alert}", description="Eventos que requieren atención humana"
         )
+        # Series creadas en 0 al arrancar: increase() necesita una muestra previa,
+        # si no, el PRIMER evento de una categoría nueva no dispararía la alerta.
+        for category in ALERT_CATEGORIES:
+            self._alerts.add(0, {"category": category})
 
     def transaction_finished(
         self, status: TransactionStatus, priority: str, duration_seconds: float
@@ -216,7 +238,8 @@ class OtelMetrics:
         self._circuit.set(_CIRCUIT_VALUE[state])
 
     def alert(self, kind: AlertKind, reason: str) -> None:
-        self._alerts.add(1, {"kind": str(kind), "reason": reason})
+        # El reason detallado va en los logs; aquí solo la categoría (cardinalidad fija).
+        self._alerts.add(1, {"category": alert_category(kind, reason)})
 
 
 @dataclass

@@ -1,0 +1,10 @@
+# Sondeo externo de /readyz: independiente del pipeline OTLP. Si Alloy o el
+# exportador de métricas del worker caen, esta señal sigue llegando.
+modules:
+  http_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      valid_status_codes: [200]
+      preferred_ip_protocol: ip4

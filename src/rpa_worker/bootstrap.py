@@ -68,6 +68,7 @@ def setup_observability(settings: Settings) -> Telemetry:
         service_name=obs.service_name,
         otlp_endpoint=endpoint,
         metrics_interval_seconds=obs.metrics_export_interval_seconds,
+        instance_id=consumer_name(settings),
     )
 
 

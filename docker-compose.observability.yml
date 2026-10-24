@@ -1,0 +1,103 @@
+# Observabilidad autohospedada (opcional). Se combina con el compose base:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d --build --wait
+#
+#   Grafana     http://localhost:${GRAFANA_PORT:-3000}  (usuario/contraseña desde .env, sin valores por defecto)
+#   Prometheus  http://localhost:${PROMETHEUS_PORT:-9090}
+#
+# Flujo:
+#   worker --OTLP/HTTP--> Alloy --> Tempo (trazas)
+#                              \--> Prometheus /api/v1/otlp (métricas; --web.enable-otlp-receiver)
+#   stdout de los contenedores --> Alloy (socket de Docker) --> Loki (logs)
+#   Prometheus --> blackbox-exporter --> worker /readyz   (sondeo externo independiente)
+#
+# Retención acotada: Loki 7 d, Tempo 72 h, Prometheus 15 d o 5 GB.
+
+services:
+  worker:
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4318
+    depends_on:
+      alloy:
+        condition: service_started
+
+  alloy:
+    image: grafana/alloy:v1.21.2
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+    volumes:
+      - ./observability/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      # Lectura de logs de contenedores. Ojo: el socket da acceso a la API de
+      # Docker; en producción usar un recolector de logs del nodo o un proxy
+      # del socket de solo lectura.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy-data:/var/lib/alloy/data
+    depends_on: [loki, tempo, prometheus]
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.7.9
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ./observability/loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:2.10.10
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./observability/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --storage.tsdb.retention.size=5GB
+      - --web.enable-otlp-receiver
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    restart: unless-stopped
+
+  blackbox:
+    image: prom/blackbox-exporter:v0.29.1
+    command: ["--config.file=/etc/blackbox/blackbox.yml"]
+    volumes:
+      - ./observability/blackbox/blackbox.yml:/etc/blackbox/blackbox.yml:ro
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.4.13
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:?definir en .env}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?definir en .env}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    depends_on: [loki, tempo, prometheus]
+    restart: unless-stopped
+
+volumes:
+  alloy-data:
+  loki-data:
+  tempo-data:
+  prometheus-data:
+  grafana-data:

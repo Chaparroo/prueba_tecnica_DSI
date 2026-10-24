@@ -54,6 +54,8 @@ packages = ["src/rpa_worker"]
 target-version = "py312"
 line-length = 100
 src = ["src", "tests"]
+# REVISION.md cita código ajeno tal cual; no se formatea.
+extend-exclude = ["REVISION.md"]
 
 [tool.ruff.lint]
 select = [
@@ -81,6 +83,9 @@ ignore = ["N818"]
 "migrations/**" = ["TID251"]
 "tests/integration/**" = ["TID251"]
 "tests/unit/test_http_api.py" = ["TID251"]  # prueba del adaptador HTTP
+# Tooling de desarrollo: invoca `docker` por PATH a propósito.
+"scripts/**" = ["S603", "S607"]
+"deploy/**" = ["S104"]
 
 # El dominio y la aplicación no pueden importar infraestructura.
 [tool.ruff.lint.flake8-tidy-imports.banned-api]

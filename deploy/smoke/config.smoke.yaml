@@ -1,0 +1,99 @@
+# Config de la prueba de humo (scripts/smoke.py). Igual a la de ejemplo salvo
+# la API (servidor falso local) y tiempos cortos para que la prueba sea rápida.
+# Sin secretos: llegan por entorno.
+
+# Plantilla de configuración. Copia este archivo a config/config.yaml (ignorado
+# por git) y ajústalo. NUNCA pongas credenciales aquí: van por variables de
+# entorno (ver .env.example).
+#
+# Reglas de coherencia validadas al arrancar (el worker no inicia si fallan):
+#   peor_caso_item = max_attempts * (connect + read)
+#                  + (max_attempts - 1) * max(backoff.max_seconds, max_retry_after_seconds)
+#                  + postgres.connect_timeout_seconds + statement_timeout
+#   worker.stop_grace_seconds > peor_caso_item
+#   queue.item_lease_ms / 1000 > peor_caso_item
+#   health.liveness_max_age_seconds > operación bloqueante más larga
+# Con estos valores: 3*(3+10) + 2*10 + (5+5) = 69 s.
+#
+# Presupuesto de apagado:
+#   69 s  peor caso de un item (intentos x timeout HTTP + backoff máx. + escritura)
+#   90 s  stop_grace_seconds = 69 s + ~30 % de margen
+#  120 s  stop_grace_period de Docker = 90 s + 30 s para End Process (cerrar
+#         pools, flush de logs/trazas). Si Docker manda SIGKILL antes, el item
+#         queda pendiente en el stream y se reclama (XAUTOCLAIM) al arrancar.
+
+worker:
+  # MaxConsecutiveSystemExceptions: circuit breaker. Al alcanzarse el worker deja
+  # de tomar items, /readyz reporta "degraded", espera el cooldown y prueba 1 item.
+  # Un 429 (rate limit) no cuenta: no indica que el sistema esté roto.
+  max_consecutive_system_exceptions: 3
+  # MaxRetryNumber: reencolados a nivel de item antes de ir al DLQ (Abandoned).
+  # El reencolado por Retry-After largo SÍ lo consume.
+  max_retry_number: 2
+  circuit_cooldown_seconds: 60
+  stop_grace_seconds: 90
+  # Reintento de item: ready_at = ahora + base * 2^(retry_count - 1)
+  item_retry_base_seconds: 30
+  # Tope absoluto para cualquier ready_at (incluye Retry-After del servidor).
+  max_retry_delay_seconds: 3600
+  # Items devueltos sin procesar: ShouldStop durante un backoff (Retried en BD,
+  # XACK+ZADD, sin consumir MaxRetryNumber) o fallo transitorio de Postgres
+  # (liberado sin tocar la BD). Por fallo: ready_at = base * 2^release_count
+  # (5, 10, 20... s) hasta max_release_delay_seconds. La liberación manda el item
+  # al final de su stream: puede alterar el orden dentro de una prioridad.
+  release_delay_seconds: 5
+  max_release_delay_seconds: 300
+  # Un item que se libera una y otra vez va al DLQ (reason=max_age, alerta
+  # propia) al superar esta antigüedad desde su primer encolado.
+  max_item_age_seconds: 86400
+  # Mensajes venenosos: tras N entregas (crash o bug con este item) va al DLQ
+  # con motivo max_deliveries. Una caída de Postgres NO cuenta: el item se libera.
+  max_deliveries: 5
+  # Nombre del consumer: env CONSUMER_NAME > esta llave > HOSTNAME. Debe ser
+  # ESTABLE entre despliegues y ÚNICO por proceso (dos procesos con el mismo
+  # nombre se robarían los items en vuelo al arrancar).
+  # consumer_name: worker-1
+
+queue:
+  stream_prefix: "rpa:queue"
+  priorities: [high, normal, low]   # orden de consulta
+  consumer_group: "rpa-workers"
+  block_ms: 500
+  retry_zset_key: "rpa:retry"
+  dlq_stream: "rpa:dlq"
+  should_stop_key: "control:should_stop"
+  item_lease_ms: 120000
+  claim_interval_ms: 15000      # XAUTOCLAIM COUNT 1; revisión de pendientes huérfanos
+  # Al arrancar: XGROUP DELCONSUMER de consumers con 0 pendientes e inactivos
+  # más de estas horas (restos de despliegues anteriores).
+  stale_consumer_hours: 24
+
+http:
+  base_url: "http://fake-api:8000"
+  connect_timeout_seconds: 3
+  read_timeout_seconds: 10
+  max_retry_after_seconds: 10
+  user_agent: "rpa-worker/0.1"
+  backoff:                # reintento dentro del item (capa 1)
+    max_attempts: 3
+    base_seconds: 0.5
+    max_seconds: 8
+
+postgres:
+  pool_min_size: 1
+  pool_max_size: 4
+  connect_timeout_seconds: 5
+  statement_timeout_ms: 5000
+
+health:
+  host: "0.0.0.0"
+  port: 8080
+  liveness_max_age_seconds: 30
+
+observability:
+  service_name: "rpa-worker"
+  log_level: INFO
+  log_format: json        # json | console
+  otlp_endpoint: null     # p. ej. "http://alloy:4318" con el compose de observabilidad
+  metrics_export_interval_seconds: 15
+  pii_fields: [email, name, username, phone, address, password, token]

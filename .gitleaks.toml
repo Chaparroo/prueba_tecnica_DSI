@@ -1,0 +1,7 @@
+[extend]
+useDefault = true
+
+[allowlist]
+# REVISION.md cita a propósito el código del PR revisado, con sus credenciales
+# expuestas (son parte del ejercicio, no secretos de este proyecto).
+paths = ['''REVISION\.md''']

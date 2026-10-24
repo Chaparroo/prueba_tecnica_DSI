@@ -1,0 +1,16 @@
+# Solo entra lo que el Dockerfile copia explícitamente.
+.git
+.venv
+**/__pycache__
+.mypy_cache
+.pytest_cache
+.ruff_cache
+tests
+observability
+deploy
+scripts
+.env
+.env.*
+config/config.yaml
+*.md
+!README.md

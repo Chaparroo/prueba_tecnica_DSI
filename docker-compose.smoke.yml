@@ -1,0 +1,34 @@
+# Override para la prueba de humo (scripts/smoke.py) y CI: API falsa local con
+# latencia configurable, config de humo y sin reinicio automático del worker
+# (la prueba verifica que sale con código 0 tras SIGTERM o `rpa-worker stop`).
+#
+#   docker compose -p rpa-smoke -f docker-compose.yml -f docker-compose.smoke.yml up -d --wait
+
+services:
+  fake-api:
+    image: python:3.12.13-slim-bookworm
+    command: ["python", "/srv/server.py"]
+    environment:
+      FAKE_API_SLOW_IDS: ${FAKE_API_SLOW_IDS:-7,10}
+      FAKE_API_SLOW_SECONDS: ${FAKE_API_SLOW_SECONDS:-8}
+    volumes:
+      - ./deploy/fake-api/server.py:/srv/server.py:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    read_only: true
+    user: "65534:65534"
+
+  worker:
+    restart: "no"
+    volumes:
+      - ./deploy/smoke/config.smoke.yaml:/app/config/config.yaml:ro
+    depends_on:
+      fake-api:
+        condition: service_healthy

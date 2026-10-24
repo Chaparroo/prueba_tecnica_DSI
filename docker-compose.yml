@@ -1,0 +1,116 @@
+# Stack base: worker + Redis (AOF) + Postgres + migraciones.
+#
+#   cp .env.example .env && cp config/config.example.yaml config/config.yaml
+#   docker compose up -d --build --wait
+#
+# Observabilidad (opcional): añade -f docker-compose.observability.yml.
+# Los secretos llegan SOLO desde .env (ignorado por git); compose falla si faltan.
+
+name: rpa
+
+x-postgres-env: &postgres-env
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: ${POSTGRES_DB:?definir en .env}
+  POSTGRES_USER: ${POSTGRES_USER:?definir en .env}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?definir en .env}
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  tmpfs: ["/tmp"]
+
+services:
+  redis:
+    image: redis:7.4.11-alpine
+    # AOF es requisito de despliegue: sin él, un reinicio de Redis pierde
+    # streams, PEL (items en vuelo) y reintentos programados.
+    command:
+      - sh
+      - -c
+      - exec redis-server --appendonly yes --appendfsync everysec --requirepass "$$REDIS_PASSWORD"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?definir en .env}
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?definir en .env}
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17.11-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?definir en .env}
+      POSTGRES_USER: ${POSTGRES_USER:?definir en .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?definir en .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # Paso explícito de despliegue: migra y termina. El worker nunca migra.
+  migrate:
+    build: .
+    image: rpa-worker:local
+    command: ["/app/.venv/bin/alembic", "upgrade", "head"]
+    environment: *postgres-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    <<: *hardening
+
+  worker:
+    build: .
+    image: rpa-worker:local
+    init: true  # PID 1 mínimo: reenvía SIGTERM al proceso Python y recoge zombies
+    # > stop_grace_seconds (90 s) del YAML, que a su vez > peor caso de un item (69 s).
+    stop_grace_period: 120s
+    # Nombre de consumer ESTABLE (HOSTNAME cambia en cada recreación) y ÚNICO.
+    # Para más réplicas, duplicar el servicio con worker-2, worker-3...
+    hostname: worker-1
+    environment:
+      <<: *postgres-env
+      CONSUMER_NAME: worker-1
+      REDIS_URL: redis://:${REDIS_PASSWORD:?definir en .env}@redis:6379/0
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+    volumes:
+      - ./config/config.yaml:/app/config/config.yaml:ro
+    ports:
+      - "${WORKER_HEALTH_PORT:-8080}:8080"
+    healthcheck:
+      # Sin curl/wget en la imagen slim: Python del propio venv.
+      test:
+        - CMD
+        - /app/.venv/bin/python
+        - -c
+        - "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/livez', timeout=3).status == 200 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # Sale con 0 tras SIGTERM o `rpa-worker stop`. unless-stopped lo vuelve a
+    # arrancar en ese caso (la llave de parada anterior se ignora: sin bucle).
+    # Para dejarlo detenido: `docker compose stop worker`.
+    restart: unless-stopped
+    <<: *hardening
+
+volumes:
+  redis-data:
+  postgres-data:

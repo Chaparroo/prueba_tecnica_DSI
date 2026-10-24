@@ -1,0 +1,153 @@
+# promtool test rules observability/prometheus/tests/alerts_test.yml
+rule_files:
+  - ../rules/alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Pipeline caído: sin rpa_worker_up dispara a los 5 min, no antes.
+  - interval: 1m
+    input_series:
+      - series: 'probe_success{job="rpa-readyz", instance="http://worker:8080/readyz"}'
+        values: "1x20"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: RpaWorkerTelemetryAbsent
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: RpaWorkerTelemetryAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: rpa-worker
+            exp_annotations:
+              summary: "Sin métricas del worker desde hace 5 min"
+              description: >-
+                No llega rpa_worker_up. El worker está caído o el pipeline
+                worker -> Alloy -> Prometheus está roto: el resto de alertas por
+                métricas no puede dispararse. Verificar /readyz por fuera.
+              runbook: "README.md#runbook-telemetría-ausente"
+
+  # Telemetría presente: no hay alerta de ausencia.
+  - interval: 1m
+    input_series:
+      - series: 'rpa_worker_up{job="rpa-worker", instance="worker-1"}'
+        values: "1x20"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: RpaWorkerTelemetryAbsent
+        exp_alerts: []
+
+  # /readyz falla 3 min -> alerta; un fallo breve no.
+  - interval: 1m
+    input_series:
+      - series: 'probe_success{job="rpa-readyz", instance="http://worker:8080/readyz"}'
+        values: "1 0 1 0 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: RpaWorkerNotReady
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: RpaWorkerNotReady
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: rpa-readyz
+              instance: "http://worker:8080/readyz"
+            exp_annotations:
+              summary: "/readyz del worker falla desde hace 3 min"
+              description: "Redis o Postgres no responden, o el worker está arrancando/deteniéndose."
+              runbook: "README.md#runbook-worker-no-ready"
+
+  # Circuito abierto sostenido.
+  - interval: 1m
+    input_series:
+      - series: 'rpa_circuit_state{job="rpa-worker", instance="worker-1"}'
+        values: "0 0 2 2 2 2 2 2 2"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: RpaCircuitOpen
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: RpaCircuitOpen
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Circuit breaker abierto: el worker no toma items"
+              description: "Se alcanzó MaxConsecutiveSystemExceptions. El worker sigue vivo, prueba un item tras cada cooldown y /readyz reporta degraded."
+              runbook: "README.md#runbook-circuito-abierto"
+
+  # Cola estancada: item de 20 min durante 10 min.
+  - interval: 1m
+    input_series:
+      - series: 'rpa_queue_oldest_item_age_seconds{job="rpa-worker", instance="worker-1", priority="normal"}'
+        values: "1200+60x15"
+      - series: 'rpa_queue_oldest_item_age_seconds{job="rpa-worker", instance="worker-1", priority="high"}'
+        values: "0x15"
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: RpaQueueStalled
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              priority: normal
+            exp_annotations:
+              summary: "Cola normal estancada: item más viejo de 32m 0s"
+              description: "Hay trabajo esperando y no avanza (worker detenido, circuito abierto o pausa por 429)."
+              runbook: "README.md#runbook-cola-estancada"
+
+  # DLQ no vacío.
+  - interval: 1m
+    input_series:
+      - series: 'rpa_dlq_length{job="rpa-worker", instance="worker-1"}'
+        values: "0 0 3 3 3 3 3 3 3"
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: RpaDlqNotEmpty
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "3 items en el DLQ"
+              description: "Revisar con `rpa-worker drain-dlq` (dry-run) y decidir requeue."
+              runbook: "README.md#runbook-dlq"
+
+  # Primer evento de auth: la serie nació en 0, así que dispara desde el 1.er item.
+  # Las demás categorías siguen en 0: no disparan.
+  - interval: 1m
+    input_series:
+      - series: 'rpa_alerts_total{job="rpa-worker", instance="worker-1", category="auth"}'
+        values: "0 0 0 1 1 1"
+      - series: 'rpa_alerts_total{job="rpa-worker", instance="worker-1", category="max_deliveries"}'
+        values: "0 0 0 0 0 0"
+      - series: 'rpa_alerts_total{job="rpa-worker", instance="worker-1", category="max_age"}'
+        values: "0 0 0 0 0 2"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: RpaDlqAuth
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: rpa-worker
+              instance: worker-1
+              category: auth
+            exp_annotations:
+              summary: "La API externa rechaza las credenciales (401/403)"
+              description: "Cuenta para el breaker. Rotar/corregir credenciales y luego drain-dlq --dlq-reason unauthorized/forbidden."
+              runbook: "README.md#runbook-dlq"
+      - eval_time: 4m
+        alertname: RpaDlqMaxDeliveries
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: RpaDlqMaxAge
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: rpa-worker
+              instance: worker-1
+              category: max_age
+            exp_annotations:
+              summary: "Item superó max_item_age liberándose por fallos transitorios"
+              description: "Posible bug disfrazado de error de conexión, o caída de Postgres > 24 h."
+              runbook: "README.md#runbook-dlq"

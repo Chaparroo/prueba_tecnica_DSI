@@ -1,0 +1,126 @@
+# Alertas por SÍNTOMA (lo que nota el negocio u obliga a actuar), con los
+# nombres ya traducidos de OTLP a Prometheus (verificados contra v3.15.1).
+# Cada alerta enlaza la sección del runbook en el README.
+# Validación: `make rules` (promtool check rules + promtool test rules).
+
+groups:
+  - name: rpa-worker-pipeline
+    rules:
+      # Si el pipeline de métricas cae, TODAS las demás alertas se quedan mudas.
+      - alert: RpaWorkerTelemetryAbsent
+        expr: absent(rpa_worker_up{job="rpa-worker"})
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Sin métricas del worker desde hace 5 min"
+          description: >-
+            No llega rpa_worker_up. El worker está caído o el pipeline
+            worker -> Alloy -> Prometheus está roto: el resto de alertas por
+            métricas no puede dispararse. Verificar /readyz por fuera.
+          runbook: "README.md#runbook-telemetría-ausente"
+
+      # Sondeo externo independiente del pipeline OTLP (blackbox -> /readyz).
+      - alert: RpaWorkerNotReady
+        expr: probe_success{job="rpa-readyz"} == 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "/readyz del worker falla desde hace 3 min"
+          description: "Redis o Postgres no responden, o el worker está arrancando/deteniéndose."
+          runbook: "README.md#runbook-worker-no-ready"
+
+      - alert: RpaReadyzProbeAbsent
+        expr: absent(probe_success{job="rpa-readyz"})
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No hay resultados del sondeo de /readyz"
+          description: "blackbox-exporter o Prometheus no están sondeando al worker."
+          runbook: "README.md#runbook-telemetría-ausente"
+
+  - name: rpa-worker-symptoms
+    rules:
+      - alert: RpaQueueStalled
+        expr: max by (priority) (rpa_queue_oldest_item_age_seconds{job="rpa-worker"}) > 900
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Cola {{ $labels.priority }} estancada: item más viejo de {{ $value | humanizeDuration }}"
+          description: "Hay trabajo esperando y no avanza (worker detenido, circuito abierto o pausa por 429)."
+          runbook: "README.md#runbook-cola-estancada"
+
+      - alert: RpaCircuitOpen
+        expr: max(rpa_circuit_state{job="rpa-worker"}) == 2
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Circuit breaker abierto: el worker no toma items"
+          description: >-
+            Se alcanzó MaxConsecutiveSystemExceptions. El worker sigue vivo,
+            prueba un item tras cada cooldown y /readyz reporta degraded.
+          runbook: "README.md#runbook-circuito-abierto"
+
+      - alert: RpaDlqNotEmpty
+        expr: max(rpa_dlq_length{job="rpa-worker"}) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} items en el DLQ"
+          description: "Revisar con `rpa-worker drain-dlq` (dry-run) y decidir requeue."
+          runbook: "README.md#runbook-dlq"
+
+  # Un item llegó al DLQ por un motivo que exige a una persona. Las series
+  # rpa_alerts_total{category} nacen en 0 al arrancar el worker, así que el
+  # primer evento ya produce increase() > 0.
+  - name: rpa-worker-dlq-reasons
+    rules:
+      - alert: RpaDlqAuth
+        expr: increase(rpa_alerts_total{job="rpa-worker", category="auth"}[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "La API externa rechaza las credenciales (401/403)"
+          description: "Cuenta para el breaker. Rotar/corregir credenciales y luego drain-dlq --dlq-reason unauthorized/forbidden."
+          runbook: "README.md#runbook-dlq"
+
+      - alert: RpaDlqContract
+        expr: increase(rpa_alerts_total{job="rpa-worker", category="contract"}[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Contrato roto con la API o la BD (400/409/422, respuesta inválida, fila rechazada)"
+          description: "No reencolar hasta entender el cambio de contrato."
+          runbook: "README.md#runbook-dlq"
+
+      - alert: RpaDlqPoison
+        expr: increase(rpa_alerts_total{job="rpa-worker", category="poison"}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Mensaje ilegible en la cola (enviado al DLQ)"
+          description: "Un productor publicó un mensaje sin el formato esperado. Nunca se reencola."
+          runbook: "README.md#runbook-dlq"
+
+      - alert: RpaDlqMaxDeliveries
+        expr: increase(rpa_alerts_total{job="rpa-worker", category="max_deliveries"}[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Item venenoso: agotó max_deliveries (tumba al worker o dispara un bug)"
+          description: "drain-dlq lo excluye por defecto. Investigar last_error antes de --include-poison."
+          runbook: "README.md#runbook-dlq"
+
+      - alert: RpaDlqMaxAge
+        expr: increase(rpa_alerts_total{job="rpa-worker", category="max_age"}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Item superó max_item_age liberándose por fallos transitorios"
+          description: "Posible bug disfrazado de error de conexión, o caída de Postgres > 24 h."
+          runbook: "README.md#runbook-dlq"
