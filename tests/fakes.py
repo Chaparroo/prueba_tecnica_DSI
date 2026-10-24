@@ -14,6 +14,7 @@ from rpa_worker.application.ports import (
     DlqEntry,
     NotReopenableError,
     TransactionRecord,
+    UnparseableDlqEntry,
 )
 from rpa_worker.application.should_stop import ShouldStop
 from rpa_worker.domain.exceptions import AlertKind, SystemException
@@ -70,13 +71,14 @@ class FakeQueue:
         # reintento actualiza el score en vez de duplicar el miembro.
         self.retry_zset: dict[tuple[str, int], tuple[Transaction, float]] = {}
         self.scheduled: list[tuple[Transaction, float]] = []  # historial de ZADD
-        self.dlq: list[DlqEntry] = []
+        self.dlq_all: list[DlqEntry | UnparseableDlqEntry] = []
         self.errors: dict[str, str] = {}
         self.fetched: list[str] = []
         self.fetch_calls = 0
         self._ids = itertools.count(1)
         self.on_empty: Hook | None = None
         self.on_fetch: Hook | None = None
+        self.on_restore: Callable[[DlqEntry], None] | None = None
         self.fail_next_redis_op = False
         self.fail_fetch = 0
 
@@ -148,9 +150,19 @@ class FakeQueue:
     ) -> None:
         self._maybe_fail()
         error = last_error or self.errors.pop(transaction.reference, None)
-        self.dlq.append(DlqEntry(f"dlq-{next(self._ids)}", transaction, reason, error))
+        self.add_dlq(DlqEntry(self._next_dlq_id(), transaction, reason, error))
         self.pending.pop(delivery.message_id, None)
         self.acked.append(delivery.message_id)
+
+    def _next_dlq_id(self) -> str:
+        return f"{next(self._ids)}-0"  # ordenable como los ids de stream
+
+    def add_dlq(self, entry: DlqEntry | UnparseableDlqEntry) -> None:
+        self.dlq_all.append(entry)
+
+    @property
+    def dlq(self) -> list[DlqEntry]:
+        return [e for e in self.dlq_all if isinstance(e, DlqEntry)]
 
     def note_failure(self, delivery: Delivery, error: str) -> None:
         self.errors[delivery.transaction.reference] = error
@@ -161,12 +173,26 @@ class FakeQueue:
         return matches[-1] if matches else None
 
     def restore(self, entry: DlqEntry, transaction: Transaction) -> bool:
+        if self.on_restore is not None:
+            self.on_restore(entry)
         self._maybe_fail()
-        if entry not in self.dlq:  # XDEL como puerta
+        if entry not in self.dlq_all:  # XDEL como puerta
             return False
-        self.dlq.remove(entry)
+        self.dlq_all.remove(entry)
         self.push(transaction)
         return True
+
+    def last_entry_id(self) -> str | None:
+        return self.dlq_all[-1].entry_id if self.dlq_all else None
+
+    def scan(
+        self, *, after: str | None, until: str, count: int
+    ) -> list[DlqEntry | UnparseableDlqEntry]:
+        def key(entry_id: str) -> int:
+            return int(entry_id.split("-")[0])
+
+        lo = key(after) if after else -1
+        return [e for e in self.dlq_all if lo < key(e.entry_id) <= key(until)][:count]
 
 
 @dataclass
@@ -193,6 +219,8 @@ class FakeRepository:
         self.fail_record = 0
         self.down = False  # Postgres caído: toda operación falla (transitorio)
         self.reject_next = False  # la BD rechaza la fila (no reintentable)
+        # Referencias cuyo record() falla SIEMPRE como transitorio (bug disfrazado).
+        self.fail_refs: set[str] = set()
 
     def _check(self) -> None:
         if self.down:
@@ -207,8 +235,8 @@ class FakeRepository:
 
     def record(self, record: TransactionRecord) -> bool:
         self._check()
-        if self.fail_record:
-            self.fail_record -= 1
+        if self.fail_record or record.reference in self.fail_refs:
+            self.fail_record = max(0, self.fail_record - 1)
             raise SystemException("database_unavailable", "fake", retryable=True)
         if self.reject_next:
             self.reject_next = False

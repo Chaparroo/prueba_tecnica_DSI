@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import random
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 
 import structlog
@@ -125,7 +125,7 @@ class ProcessTransaction:
         try:
             existing = self._repo.find_terminal_status(tx.reference)
         except SystemException as exc:
-            return self._release_after_infra_failure(delivery, exc)
+            return self._release_after_infra_failure(delivery, exc, started)
         if existing is not None:
             # Doble entrega de un item ya cerrado: no se reprocesa, se acusa.
             log.info("transaction.duplicate_delivery", existing_status=str(existing))
@@ -251,7 +251,7 @@ class ProcessTransaction:
                 log.info("transaction.idempotent_noop", attempted_status=str(outcome.status))
         except SystemException as exc:
             if exc.retryable:
-                return self._release_after_infra_failure(delivery, exc)
+                return self._release_after_infra_failure(delivery, exc, started)
             return self._abandon_rejected_row(delivery, exc, started)
 
         log_transition(
@@ -285,16 +285,53 @@ class ProcessTransaction:
 
     # ------------------------------------------------------- caminos de fallo
 
-    def _release_after_infra_failure(self, delivery: Delivery, exc: SystemException) -> ItemResult:
-        """Postgres (u otra dependencia) no respondió: devolver el item intacto."""
+    def _release_after_infra_failure(
+        self, delivery: Delivery, exc: SystemException, started: float
+    ) -> ItemResult:
+        """Postgres (u otra dependencia) no respondió: devolver el item sin procesar.
+
+        No consume retry_count ni max_deliveries (cada liberación es una entrada
+        nueva en el stream, al final de su prioridad: puede alterar el orden).
+        El ready_at crece con release_count y el tope es por antigüedad: así una
+        caída larga de Postgres no manda items sanos al DLQ, pero un item que
+        falla "transitoriamente" para siempre no se libera para siempre.
+        """
         log.error("transaction.infra_failure", reason=exc.reason, error=str(exc))
         if exc.alert is not None:
             self._raise_alert(exc.alert, exc.reason, str(exc))
-        ready_at = self._clock.now() + self._s.release_delay_seconds
-        release = partial(self._queue.schedule_retry, delivery, delivery.transaction, ready_at)
+        tx = delivery.transaction
+        now = self._clock.now()
+        first_enqueued_at = tx.first_enqueued_at or now
+        age = now - first_enqueued_at
+        if age > self._s.max_item_age_seconds:
+            outcome = Outcome(
+                S.ABANDONED,
+                tx.retry_count,
+                BreakerSignal.FAILURE,
+                reason="max_age",
+                error=(
+                    f"{exc.reason}: {exc} (antigüedad {age:.0f}s, {tx.release_count} liberaciones)"
+                ),
+                alert=AlertKind.MAX_AGE,
+            )
+            return self._dead_letter_best_effort(delivery, outcome, started)
+
+        delay = min(
+            self._s.release_delay_seconds * (2.0**tx.release_count),
+            self._s.max_release_delay_seconds,
+        )
+        released = replace(
+            tx, release_count=tx.release_count + 1, first_enqueued_at=first_enqueued_at
+        )
+        release = partial(self._queue.schedule_retry, delivery, released, now + delay)
         if self._redis_step(delivery, release, BreakerSignal.NEUTRAL) is BreakerSignal.NEUTRAL:
             self._metrics.retry("release", exc.reason)
-            log.info("transaction.released", reason=exc.reason, ready_at=ready_at)
+            log.info(
+                "transaction.released",
+                reason=exc.reason,
+                release_count=released.release_count,
+                retry_in_seconds=delay,
+            )
         # Sea cual sea el resultado en Redis, es una excepción de sistema para el breaker.
         return ItemResult(BreakerSignal.FAILURE)
 

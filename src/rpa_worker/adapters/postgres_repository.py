@@ -160,12 +160,25 @@ class PostgresRepository:
             conn.transaction(),
             conn.cursor(row_factory=dict_row) as cur,
         ):
+            # Si entró al DLQ sin fila (max_deliveries con Postgres caído), se crea
+            # en Abandoned. ON CONFLICT serializa a dos operadores concurrentes:
+            # sin esto, ambos verían "sin fila" (FOR UPDATE no bloquea filas que
+            # no existen) y el segundo INSERT violaría el UNIQUE.
+            cur.execute(
+                "INSERT INTO transaction_results "
+                "(reference, status, priority, retry_count, requeue_count, error_reason, "
+                " correlation_id) VALUES (%s, 'Abandoned', %s, 0, 0, %s, %s) "
+                "ON CONFLICT (reference) DO NOTHING",
+                (tx.reference, tx.priority, entry.reason, tx.correlation_id),
+            )
             row = cur.execute(
                 "SELECT status, requeue_count FROM transaction_results "
                 "WHERE reference = %s FOR UPDATE",
                 (tx.reference,),
             ).fetchone()
-            if row is not None and row["status"] in (S.SUCCESSFUL, S.FAILED):
+            if row is None:  # imposible tras el INSERT; defensa explícita
+                raise SystemException("database_error", "reopen: fila ausente", retryable=True)
+            if row["status"] in (S.SUCCESSFUL, S.FAILED):
                 # Sale del bloque de transacción por excepción: rollback.
                 raise NotReopenableError(tx.reference, S(row["status"]))
             cur.execute(
@@ -180,14 +193,6 @@ class PostgresRepository:
                     entry.last_error,
                 ),
             )
-            if row is None:  # entró al DLQ por max_deliveries sin fila
-                cur.execute(
-                    "INSERT INTO transaction_results "
-                    "(reference, status, priority, retry_count, requeue_count, correlation_id) "
-                    "VALUES (%s, 'Retried', %s, 0, 1, %s)",
-                    (tx.reference, tx.priority, tx.correlation_id),
-                )
-                return 1
             if row["status"] == S.ABANDONED:
                 cur.execute(
                     "UPDATE transaction_results SET status = 'Retried', retry_count = 0, "

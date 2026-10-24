@@ -43,9 +43,13 @@ class Transaction:
     status: TransactionStatus = TransactionStatus.NEW
     correlation_id: str = ""
     traceparent: str | None = None
-    # Epoch (s) del primer encolado. Se conserva entre reintentos para medir
-    # la edad real del item.
-    enqueued_at: float = 0.0
+    # Epoch (s) del primer encolado. Se conserva entre reintentos y
+    # liberaciones; es la base del tope max_item_age. 0 = desconocido (se
+    # fija en la primera liberación). Un requeue manual lo reinicia.
+    first_enqueued_at: float = 0.0
+    # Liberaciones por fallo transitorio de infraestructura. No consume
+    # MaxRetryNumber; solo hace crecer el ready_at de la siguiente liberación.
+    release_count: int = 0
     # Reaperturas manuales desde el DLQ (``requeue``). retry_count vuelve a 0
     # en cada una; requeue_count conserva la historia.
     requeue_count: int = 0
@@ -54,8 +58,8 @@ class Transaction:
     def __post_init__(self) -> None:
         if not self.reference:
             raise ValueError("Transaction.reference no puede estar vacío")
-        if self.retry_count < 0 or self.requeue_count < 0:
-            raise ValueError("Transaction.retry_count/requeue_count no pueden ser negativos")
+        if min(self.retry_count, self.requeue_count, self.release_count) < 0:
+            raise ValueError("Transaction: los contadores no pueden ser negativos")
 
     def with_status(self, status: TransactionStatus) -> Transaction:
         return replace(self, status=status)

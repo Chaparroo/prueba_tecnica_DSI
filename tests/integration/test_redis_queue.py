@@ -8,7 +8,12 @@ import time
 import redis
 
 from rpa_worker.adapters import codec
-from rpa_worker.adapters.redis_queue import QueueKeys, RedisQueue, read_queue_stats
+from rpa_worker.adapters.redis_queue import (
+    QueueKeys,
+    RedisQueue,
+    read_queue_stats,
+    redis_cluster_enabled,
+)
 from tests.fakes import make_tx
 from tests.integration.conftest import make_queue, xrange, zrange_with_scores
 
@@ -175,10 +180,63 @@ def test_unparseable_message_goes_to_dlq(queue: RedisQueue, redis_client: redis.
     assert fields["reason"] == "unparseable"
 
 
-def test_should_stop_key(queue: RedisQueue, redis_client: redis.Redis) -> None:
+def test_stop_key_created_after_start_is_honored(
+    queue: RedisQueue, redis_client: redis.Redis, keys: QueueKeys
+) -> None:
     assert queue.is_requested() is False
-    redis_client.set("control:should_stop", "1", ex=60)
+    cli = make_queue(redis_client, keys, "cli")
+    cli.request_stop(ttl_seconds=60)
     assert queue.is_requested() is True
+    assert 0 < int(redis_client.ttl("control:should_stop")) <= 60  # TTL obligatorio
+    assert cli.clear_stop() is True
+    assert queue.is_requested() is False
+
+
+def test_stop_key_older_than_worker_start_is_ignored(
+    redis_client: redis.Redis, keys: QueueKeys
+) -> None:
+    """Una llave olvidada no produce un bucle de reinicios."""
+    make_queue(redis_client, keys, "cli").request_stop(ttl_seconds=60)
+    time.sleep(0.01)
+    restarted = make_queue(redis_client, keys, "worker-a")
+    restarted.prepare()  # arranque posterior a la llave
+    assert restarted.is_requested() is False
+
+
+def test_stop_key_written_by_hand_is_ignored(queue: RedisQueue, redis_client: redis.Redis) -> None:
+    redis_client.set("control:should_stop", "1", ex=60)  # redis-cli sin el comando
+    assert queue.is_requested() is False
+
+
+def test_stale_idle_consumers_without_pending_are_deleted(
+    redis_client: redis.Redis, keys: QueueKeys
+) -> None:
+    first = make_queue(redis_client, keys, "old-idle")
+    first.prepare()
+    assert first.fetch_next() is None  # registra el consumer sin pendientes
+    busy = make_queue(redis_client, keys, "old-busy")
+    busy.publish(make_tx("REF-BUSY", 1))
+    assert busy.fetch_next() is not None  # queda con 1 pendiente
+    time.sleep(0.3)
+
+    worker = RedisQueue(
+        redis_client,
+        keys,
+        group="rpa-workers",
+        consumer="worker-new",
+        block_ms=100,
+        lease_ms=120_000,
+        claim_interval_ms=100,
+        stale_consumer_ms=200,
+    )
+    worker.prepare()
+    names = {c["name"] for c in redis_client.xinfo_consumers("rpa:queue:normal", "rpa-workers")}
+    assert "old-idle" not in names  # 0 pendientes e inactivo: borrado
+    assert "old-busy" in names  # con pendientes: NUNCA se borra
+
+
+def test_standalone_redis_is_not_cluster(redis_client: redis.Redis) -> None:
+    assert redis_cluster_enabled(redis_client) is False
 
 
 def test_queue_stats_report_oldest_age_and_dlq(

@@ -407,21 +407,29 @@ def test_transient_postgres_failure_releases_item_untouched(h: Harness) -> None:
     assert ("release", "database_unavailable") in h.metrics.retries
 
 
-def test_long_postgres_outage_sends_nothing_to_dlq(h: Harness) -> None:
+def test_long_postgres_outage_sends_nothing_to_dlq(
+    h: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Postgres caído durante muchos leases (> max_deliveries x 120 s) con varios items."""
     for i in range(1, 6):
         h.queue.push(make_tx(f"REF-{i}", i))
     h.repo.down = True
     outage_end = h.clock.monotonic() + 30 * 60  # 30 min >> 5 x 120 s
 
-    fetches_while_open: list[int] = []
-
     def on_sleep() -> None:
-        if h.runner.breaker.state is CircuitState.OPEN:
-            fetches_while_open.append(h.queue.fetch_calls)
         if h.clock.monotonic() >= outage_end:
             h.repo.down = False
 
+    # Con el breaker abierto no se lee ni se reclama (XREADGROUP/XAUTOCLAIM):
+    # solo la sonda, que ocurre en half_open.
+    fetch_next = h.queue.fetch_next
+    states_at_fetch: list[CircuitState] = []
+
+    def guarded_fetch() -> Any:
+        states_at_fetch.append(h.runner.breaker.state)
+        return fetch_next()
+
+    monkeypatch.setattr(h.queue, "fetch_next", guarded_fetch)
     h.sleeper.on_sleep = on_sleep
     h.drain_with_retries(step_seconds=10)
     h.run()
@@ -429,11 +437,71 @@ def test_long_postgres_outage_sends_nothing_to_dlq(h: Harness) -> None:
     assert h.queue.dlq == []
     assert all(h.repo.rows[f"REF-{i}"].record.status is S.SUCCESSFUL for i in range(1, 6))
     assert all(r.record.retry_count == 0 for r in h.repo.rows.values())
-    # Con el breaker abierto no se lee ni se reclama: solo la sonda tras cada cooldown.
-    cooldowns = h.clock.monotonic() // h.runner_settings.circuit_cooldown_seconds + 1
-    assert h.queue.fetch_calls <= 3 + cooldowns + 10
-    assert len(set(fetches_while_open)) <= cooldowns
+    assert CircuitState.OPEN not in states_at_fetch
+    assert CircuitState.HALF_OPEN in states_at_fetch  # hubo sondas durante la caída
     assert h.runner.breaker.state is CircuitState.CLOSED
+
+
+def test_release_delay_grows_with_release_count(h: Harness) -> None:
+    h.repo.fail_record = 4
+    h.queue.push(make_tx("REF-G", 1))
+    h.drain_with_retries(step_seconds=1)
+    with capture_logs() as logs:
+        h.run()
+    released = [e for e in logs if e["event"] == "transaction.released"]
+    assert [e["retry_in_seconds"] for e in released] == [5, 10, 20, 40]
+    assert [e["release_count"] for e in released] == [1, 2, 3, 4]
+    row = h.repo.rows["REF-G"].record
+    assert (row.status, row.retry_count) == (S.SUCCESSFUL, 0)
+
+
+def test_release_delay_is_capped(h: Harness) -> None:
+    h.repo.fail_record = 9
+    h.queue.push(make_tx("REF-CAPPED", 1))
+    h.drain_with_retries(step_seconds=1)
+    with capture_logs() as logs:
+        h.run()
+    delays = [e["retry_in_seconds"] for e in logs if e["event"] == "transaction.released"]
+    assert max(delays) == h.processing.max_release_delay_seconds
+
+
+def test_item_failing_transiently_forever_reaches_dlq_by_age(h: Harness) -> None:
+    """Un bug disfrazado de error de conexión no se libera para siempre."""
+    h.repo.fail_refs = {"REF-STUCK"}
+    h.queue.push(make_tx("REF-STUCK", 1))
+    for i in range(2, 7):
+        h.queue.push(make_tx(f"REF-OK-{i}", i))  # éxitos alrededor reinician el breaker
+    first_seen = h.clock.now()
+    h.drain_with_retries(step_seconds=600)
+    h.run()
+
+    (entry,) = h.queue.dlq
+    assert entry.transaction.reference == "REF-STUCK"
+    assert entry.reason == "max_age"
+    assert entry.transaction.release_count > 10
+    assert entry.transaction.first_enqueued_at == first_seen  # fijado en la 1.ª liberación
+    assert "database_unavailable" in (entry.last_error or "")
+    assert (AlertKind.MAX_AGE, "max_age") in h.metrics.alerts
+    assert h.clock.now() - first_seen > h.processing.max_item_age_seconds
+    assert all(h.repo.rows[f"REF-OK-{i}"].record.status is S.SUCCESSFUL for i in range(2, 7))
+
+
+def test_requeue_resets_age_and_release_count(h: Harness) -> None:
+    from rpa_worker.application.requeue import RequeueFromDlq
+
+    h.repo.fail_refs = {"REF-AGED"}
+    h.queue.push(make_tx("REF-AGED", 1))
+    h.drain_with_retries(step_seconds=3_000)
+    h.run()
+    assert h.queue.dlq[0].reason == "max_age"
+
+    h.repo.fail_refs.clear()
+    RequeueFromDlq(dlq=h.queue, repository=h.repo, clock=h.clock)(
+        "REF-AGED", operator="ana", reason="bug corregido"
+    )
+    (delivery,) = h.queue.streams["normal"]
+    assert delivery.transaction.release_count == 0
+    assert delivery.transaction.first_enqueued_at == h.clock.now()
 
 
 def test_poison_message_goes_to_dlq_even_if_postgres_is_down(h: Harness) -> None:

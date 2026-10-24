@@ -34,12 +34,21 @@ worker:
   max_retry_delay_seconds: 3600
   # Items devueltos sin procesar: ShouldStop durante un backoff (Retried en BD,
   # XACK+ZADD, sin consumir MaxRetryNumber) o fallo transitorio de Postgres
-  # (liberado sin tocar la BD). ready_at = ahora + este valor.
+  # (liberado sin tocar la BD). Por fallo: ready_at = base * 2^release_count
+  # (5, 10, 20... s) hasta max_release_delay_seconds. La liberación manda el item
+  # al final de su stream: puede alterar el orden dentro de una prioridad.
   release_delay_seconds: 5
+  max_release_delay_seconds: 300
+  # Un item que se libera una y otra vez va al DLQ (reason=max_age, alerta
+  # propia) al superar esta antigüedad desde su primer encolado.
+  max_item_age_seconds: 86400
   # Mensajes venenosos: tras N entregas (crash o bug con este item) va al DLQ
   # con motivo max_deliveries. Una caída de Postgres NO cuenta: el item se libera.
   max_deliveries: 5
-  # consumer_name: null  -> usa HOSTNAME (único por contenedor)
+  # Nombre del consumer: env CONSUMER_NAME > esta llave > HOSTNAME. Debe ser
+  # ESTABLE entre despliegues y ÚNICO por proceso (dos procesos con el mismo
+  # nombre se robarían los items en vuelo al arrancar).
+  # consumer_name: worker-1
 
 queue:
   stream_prefix: "rpa:queue"
@@ -51,6 +60,9 @@ queue:
   should_stop_key: "control:should_stop"
   item_lease_ms: 120000
   claim_interval_ms: 15000      # XAUTOCLAIM COUNT 1; revisión de pendientes huérfanos
+  # Al arrancar: XGROUP DELCONSUMER de consumers con 0 pendientes e inactivos
+  # más de estas horas (restos de despliegues anteriores).
+  stale_consumer_hours: 24
 
 http:
   base_url: "https://jsonplaceholder.typicode.com"

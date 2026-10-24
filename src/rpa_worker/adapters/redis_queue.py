@@ -29,7 +29,7 @@ import structlog
 from redis.exceptions import RedisError, ResponseError
 
 from rpa_worker.adapters import codec
-from rpa_worker.application.ports import Delivery, DlqEntry
+from rpa_worker.application.ports import Delivery, DlqEntry, UnparseableDlqEntry
 from rpa_worker.domain.exceptions import SystemException
 from rpa_worker.domain.transaction import Transaction
 
@@ -108,6 +108,28 @@ def _s(value: object) -> str:
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
+def _dlq_entry(entry_id: str, fields: Mapping[Any, Any] | None) -> DlqEntry | UnparseableDlqEntry:
+    f = {_s(k): _s(v) for k, v in (fields or {}).items()}
+    try:
+        tx = codec.decode(f.get(codec.FIELD, ""))
+    except codec.UnparseableMessageError:
+        return UnparseableDlqEntry(entry_id, f.get("reason", "unparseable"))
+    failed_at = f.get("failed_at")
+    return DlqEntry(
+        entry_id,
+        tx,
+        f.get("reason", ""),
+        f.get("last_error") or None,
+        float(failed_at) if failed_at else None,
+    )
+
+
+def redis_cluster_enabled(client: redis.Redis) -> bool:
+    """Los scripts Lua tocan llaves de distintos hash slots: Cluster no es compatible."""
+    info = client.info("cluster")
+    return int(info.get("cluster_enabled", 0)) == 1
+
+
 def _data(fields: Mapping[Any, Any] | None) -> str | None:
     """Campo ``data`` de una entrada de stream (bytes o str según el cliente)."""
     if not fields:
@@ -158,9 +180,11 @@ class RedisQueue:
         block_ms: int,
         lease_ms: int,
         claim_interval_ms: int,
+        stale_consumer_ms: int = 24 * 3_600_000,
         promote_batch: int = 100,
         clock: Callable[[], float] = time.time,
         monotonic: Callable[[], float] = time.monotonic,
+        on_unparseable: Callable[[], None] = lambda: None,
     ) -> None:
         self._r = client
         self._k = keys
@@ -169,11 +193,17 @@ class RedisQueue:
         self._block_ms = block_ms
         self._lease_ms = lease_ms
         self._claim_interval = claim_interval_ms / 1000
+        self._stale_consumer_ms = stale_consumer_ms
         self._promote_batch = promote_batch
         self._now = clock
         self._mono = monotonic
+        self._on_unparseable = on_unparseable
         self._next_claim_check = 0.0
         self._own_pending_recovered = False
+        # Hora de arranque según el reloj de Redis: una llave de parada solo se
+        # respeta si se creó después (ver is_requested).
+        self._started_at: float | None = None
+        self._ignored_stop_values: set[str] = set()
         self._promote = client.register_script(PROMOTE_DUE)
         self._schedule = client.register_script(SCHEDULE_AND_ACK)
         self._ack = client.register_script(ACK)
@@ -183,7 +213,17 @@ class RedisQueue:
     # ---------------------------------------------------------- preparación
 
     def prepare(self) -> None:
+        """Init del worker: grupos, limpieza de consumers viejos y hora de arranque."""
         with redis_errors("prepare"):
+            self._started_at = self.server_time()
+            self.ensure_groups()
+            for stream in self._k.streams.values():
+                self._delete_stale_consumers(stream)
+        self.is_requested()  # avisa si hay una llave anterior al arranque
+
+    def ensure_groups(self) -> None:
+        """Crea streams y consumer group si no existen (idempotente; lo usa ``seed``)."""
+        with redis_errors("ensure_groups"):
             for stream in self._k.streams.values():
                 try:
                     # id 0: también consume lo encolado antes de crear el grupo.
@@ -191,12 +231,29 @@ class RedisQueue:
                 except ResponseError as exc:
                     if "BUSYGROUP" not in str(exc):
                         raise
-            if self._r.exists(self._k.should_stop):
-                log.warning(
-                    "queue.should_stop_key_present",
-                    key=self._k.should_stop,
-                    hint="el worker se detendrá enseguida; bórrala con DEL si no es intencional",
-                )
+
+    def _delete_stale_consumers(self, stream: str) -> None:
+        """XGROUP DELCONSUMER solo de consumers con 0 pendientes e inactivos > umbral.
+
+        Con pendientes NUNCA: borrarlo perdería su PEL. Un consumer vivo lee cada
+        block_ms, así que su ``idle`` nunca supera el umbral.
+        """
+        consumers = self._r.xinfo_consumers(stream, self._group)
+        for c in consumers:
+            name = _s(c["name"])
+            idle = int(c.get("idle") or 0)
+            inactive = int(c.get("inactive", idle) or idle)
+            if name == self._consumer or int(c.get("pending") or 0) > 0:
+                continue
+            if idle > self._stale_consumer_ms and (
+                inactive < 0 or inactive > self._stale_consumer_ms
+            ):
+                self._r.xgroup_delconsumer(stream, self._group, name)
+                log.info("queue.stale_consumer_deleted", stream=stream, consumer=name, idle_ms=idle)
+
+    def server_time(self) -> float:
+        seconds, micros = self._r.time()
+        return seconds + micros / 1_000_000
 
     # ------------------------------------------------------------ productor
 
@@ -311,6 +368,7 @@ class RedisQueue:
             tx = codec.decode(raw)
         except codec.UnparseableMessageError as exc:
             log.error("queue.unparseable_message", stream=stream, message_id=message_id)
+            self._on_unparseable()
             self._dead(
                 keys=[stream, self._k.dlq, self._k.errors],
                 args=[self._group, message_id, raw, "unparseable", str(exc), "", self._now()],
@@ -361,14 +419,27 @@ class RedisQueue:
         with redis_errors("dlq_find"):
             entries = cast(list[Any], self._r.xrevrange(self._k.dlq) or [])
         for entry_id, fields in entries:
-            f = {_s(k): _s(v) for k, v in (fields or {}).items()}
-            try:
-                tx = codec.decode(f.get(codec.FIELD, ""))
-            except codec.UnparseableMessageError:
-                continue
-            if tx.reference == reference:
-                return DlqEntry(_s(entry_id), tx, f.get("reason", ""), f.get("last_error") or None)
+            entry = _dlq_entry(_s(entry_id), fields)
+            if isinstance(entry, DlqEntry) and entry.transaction.reference == reference:
+                return entry
         return None
+
+    def last_entry_id(self) -> str | None:
+        with redis_errors("dlq_last_id"):
+            last = cast(list[Any], self._r.xrevrange(self._k.dlq, count=1) or [])
+        return _s(last[0][0]) if last else None
+
+    def scan(
+        self, *, after: str | None, until: str, count: int
+    ) -> list[DlqEntry | UnparseableDlqEntry]:
+        """XRANGE (after, until]: el tope fijo evita volver a ver lo que entre al
+        DLQ durante el recorrido."""
+        start = f"({after}" if after else "-"
+        with redis_errors("dlq_scan"):
+            entries = cast(
+                list[Any], self._r.xrange(self._k.dlq, min=start, max=until, count=count) or []
+            )
+        return [_dlq_entry(_s(entry_id), fields) for entry_id, fields in entries]
 
     def restore(self, entry: DlqEntry, transaction: Transaction) -> bool:
         with redis_errors("dlq_restore"):
@@ -381,8 +452,43 @@ class RedisQueue:
     # ------------------------------------------------------------ ShouldStop
 
     def is_requested(self) -> bool:
+        """La llave vale la hora (reloj de Redis) en que se creó. Solo se respeta
+        si es posterior al arranque de este worker: una llave olvidada no produce
+        un bucle de reinicios con ``restart: unless-stopped``."""
         with redis_errors("should_stop"):
-            return bool(self._r.exists(self._k.should_stop))
+            raw = self._r.get(self._k.should_stop)
+            if raw is None:
+                return False
+            if self._started_at is None:
+                self._started_at = self.server_time()
+        value = _s(raw)
+        try:
+            created_at = float(value)
+        except ValueError:
+            created_at = None
+        if created_at is not None and created_at > self._started_at:
+            return True
+        if value not in self._ignored_stop_values:
+            self._ignored_stop_values.add(value)
+            log.warning(
+                "queue.stale_should_stop_ignored",
+                key=self._k.should_stop,
+                value=value,
+                worker_started_at=self._started_at,
+                hint="usa `rpa-worker stop --ttl N`; esta llave es anterior al arranque o inválida",
+            )
+        return False
+
+    def request_stop(self, ttl_seconds: int) -> float:
+        """SET llave=<hora de Redis> EX ttl. TTL obligatorio: nunca queda olvidada."""
+        with redis_errors("request_stop"):
+            created_at = self.server_time()
+            self._r.set(self._k.should_stop, f"{created_at:.6f}", ex=ttl_seconds)
+        return created_at
+
+    def clear_stop(self) -> bool:
+        with redis_errors("clear_stop"):
+            return bool(self._r.delete(self._k.should_stop))
 
     # ---------------------------------------------------------------- apoyo
 

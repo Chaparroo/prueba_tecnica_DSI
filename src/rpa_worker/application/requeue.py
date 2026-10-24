@@ -23,6 +23,7 @@ from opentelemetry import propagate, trace
 from rpa_worker.application.ports import (
     Clock,
     DeadLetterStore,
+    DlqEntry,
     NotReopenableError,
     RequeueRepository,
 )
@@ -52,6 +53,11 @@ class NotInDlqError(Exception):
     pass
 
 
+def _require_audit(operator: str, reason: str) -> None:
+    if not operator.strip() or not reason.strip():
+        raise ValueError("--operator y --reason son obligatorios")
+
+
 def requeue_id_for(dlq_entry_id: str) -> str:
     """Determinista por entrada del DLQ: re-ejecutar no crea otra auditoría."""
     return str(uuid.uuid5(_REQUEUE_NAMESPACE, dlq_entry_id))
@@ -64,9 +70,7 @@ class RequeueFromDlq:
         self._clock = clock
 
     def __call__(self, reference: str, *, operator: str, reason: str) -> RequeueResult:
-        if not operator.strip() or not reason.strip():
-            raise ValueError("--operator y --reason son obligatorios")
-
+        _require_audit(operator, reason)
         entry = self._dlq.find(reference)
         if entry is None:
             status = self._repo.current_status(reference)
@@ -75,7 +79,12 @@ class RequeueFromDlq:
             if status is TransactionStatus.RETRIED:
                 return RequeueResult(RequeueStatus.ALREADY_REQUEUED, reference)
             raise NotInDlqError(f"{reference} no está en el DLQ (estado en BD: {status})")
+        return self.requeue_entry(entry, operator=operator, reason=reason)
 
+    def requeue_entry(self, entry: DlqEntry, *, operator: str, reason: str) -> RequeueResult:
+        """Los dos pasos para UNA entrada concreta (lo reutiliza drain-dlq)."""
+        _require_audit(operator, reason)
+        reference = entry.transaction.reference
         original = entry.transaction
         requeue_id = requeue_id_for(entry.entry_id)
         with structlog.contextvars.bound_contextvars(
@@ -96,7 +105,9 @@ class RequeueFromDlq:
                     retry_count=0,
                     requeue_count=requeue_count,
                     requeue_id=requeue_id,
-                    enqueued_at=self._clock.now(),
+                    # Vida nueva: reinicia la antigüedad y las liberaciones.
+                    first_enqueued_at=self._clock.now(),
+                    release_count=0,
                     traceparent=carrier.get("traceparent", original.traceparent),
                 )
                 # Paso 2: Redis (XDEL como puerta + XADD).

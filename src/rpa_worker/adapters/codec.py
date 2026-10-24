@@ -29,7 +29,8 @@ def encode(tx: Transaction) -> str:
         "retry_count": tx.retry_count,
         "correlation_id": tx.correlation_id,
         "traceparent": tx.traceparent,
-        "enqueued_at": tx.enqueued_at,
+        "first_enqueued_at": tx.first_enqueued_at,
+        "release_count": tx.release_count,
         "requeue_count": tx.requeue_count,
         "requeue_id": tx.requeue_id,
     }
@@ -51,7 +52,11 @@ def decode(raw: str | bytes) -> Transaction:
             retry_count=int(body.get("retry_count", 0)),
             correlation_id=str(body.get("correlation_id") or ""),
             traceparent=body.get("traceparent"),
-            enqueued_at=float(body.get("enqueued_at") or 0.0),
+            # "enqueued_at": nombre anterior; se acepta para mensajes ya en cola.
+            first_enqueued_at=float(
+                body.get("first_enqueued_at") or body.get("enqueued_at") or 0.0
+            ),
+            release_count=int(body.get("release_count", 0)),
             requeue_count=int(body.get("requeue_count", 0)),
             requeue_id=body.get("requeue_id"),
         )

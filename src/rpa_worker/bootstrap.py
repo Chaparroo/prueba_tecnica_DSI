@@ -6,7 +6,7 @@ import os
 import socket
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import redis
@@ -25,8 +25,14 @@ from rpa_worker.adapters.observability import (
     flush_logs,
 )
 from rpa_worker.adapters.postgres_repository import PostgresRepository, create_pool
-from rpa_worker.adapters.redis_queue import QueueKeys, RedisQueue, read_queue_stats
+from rpa_worker.adapters.redis_queue import (
+    QueueKeys,
+    RedisQueue,
+    read_queue_stats,
+    redis_cluster_enabled,
+)
 from rpa_worker.application.clock import SystemClock
+from rpa_worker.application.drain_dlq import DrainDlq, DrainFilters, DrainReport
 from rpa_worker.application.health import HealthState
 from rpa_worker.application.process_transaction import ProcessTransaction
 from rpa_worker.application.requeue import RequeueFromDlq, RequeueResult
@@ -38,6 +44,7 @@ from rpa_worker.application.should_stop import (
     install_signal_handlers,
 )
 from rpa_worker.config import Settings
+from rpa_worker.domain.exceptions import AlertKind
 from rpa_worker.domain.transaction import Transaction
 
 log = structlog.get_logger("rpa_worker.bootstrap")
@@ -85,7 +92,12 @@ def redis_client(settings: Settings, *, socket_timeout: float) -> redis.Redis:
     )
 
 
-def build_queue(settings: Settings, client: redis.Redis, consumer: str) -> RedisQueue:
+def build_queue(
+    settings: Settings,
+    client: redis.Redis,
+    consumer: str,
+    on_unparseable: Callable[[], None] = lambda: None,
+) -> RedisQueue:
     q = settings.config.queue
     return RedisQueue(
         client,
@@ -95,7 +107,20 @@ def build_queue(settings: Settings, client: redis.Redis, consumer: str) -> Redis
         block_ms=q.block_ms,
         lease_ms=q.item_lease_ms,
         claim_interval_ms=q.claim_interval_ms,
+        stale_consumer_ms=int(q.stale_consumer_hours * 3_600_000),
+        on_unparseable=on_unparseable,
     )
+
+
+def check_redis_mode(settings: Settings) -> bool | None:
+    """True si Redis está en modo cluster (no compatible); None si no se pudo verificar."""
+    client = redis_client(settings, socket_timeout=2.0)
+    try:
+        return redis_cluster_enabled(client)
+    except redis.RedisError:
+        return None
+    finally:
+        client.close()
 
 
 def build_repository(settings: Settings) -> tuple[PostgresRepository, ConnectionPool]:
@@ -112,8 +137,13 @@ def build_repository(settings: Settings) -> tuple[PostgresRepository, Connection
 
 
 def consumer_name(settings: Settings) -> str:
+    """CONSUMER_NAME > worker.consumer_name > HOSTNAME. Estable y único por proceso:
+    dos procesos con el mismo nombre se robarían los items en vuelo al arrancar."""
     return (
-        settings.config.worker.consumer_name or os.environ.get("HOSTNAME") or socket.gethostname()
+        os.environ.get("CONSUMER_NAME")
+        or settings.config.worker.consumer_name
+        or os.environ.get("HOSTNAME")
+        or socket.gethostname()
     )
 
 
@@ -165,7 +195,13 @@ def run_worker(settings: Settings) -> int:
     client = redis_client(settings, socket_timeout=cfg.queue.block_ms / 1000 + 5)
     # Cliente para sondas y gauges: timeout corto, nunca bloquea nada importante.
     probe_client = redis_client(settings, socket_timeout=0.5)
-    queue = build_queue(settings, client, consumer)
+    metrics = OtelMetrics()
+    queue = build_queue(
+        settings,
+        client,
+        consumer,
+        on_unparseable=lambda: metrics.alert(AlertKind.POISON, "unparseable"),
+    )
     repo, pool = build_repository(settings)
     api = JsonPlaceholderApi(
         base_url=str(cfg.http.base_url),
@@ -189,7 +225,6 @@ def run_worker(settings: Settings) -> int:
         ),
         log=log.debug,
     ).register()
-    metrics = OtelMetrics()
 
     closers = [
         api.close,
@@ -204,6 +239,11 @@ def run_worker(settings: Settings) -> int:
         for close in closers:
             close()
         return 0
+    if redis_cluster_enabled(probe_client):
+        log.error("worker.redis_cluster_unsupported", hint="usa Redis standalone con AOF")
+        for close in closers:
+            close()
+        return 2
 
     b = cfg.http.backoff
     process = ProcessTransaction(
@@ -222,6 +262,8 @@ def run_worker(settings: Settings) -> int:
             item_retry_base_seconds=cfg.worker.item_retry_base_seconds,
             max_retry_delay_seconds=cfg.worker.max_retry_delay_seconds,
             release_delay_seconds=cfg.worker.release_delay_seconds,
+            max_release_delay_seconds=cfg.worker.max_release_delay_seconds,
+            max_item_age_seconds=cfg.worker.max_item_age_seconds,
             max_deliveries=cfg.worker.max_deliveries,
         ),
         heartbeat=health.beat,
@@ -246,13 +288,16 @@ def run_worker(settings: Settings) -> int:
     return runner.run()
 
 
+CLI_CONSUMER = "cli"  # los comandos de operación no leen del grupo
+
+
 def requeue(settings: Settings, reference: str, *, operator: str, reason: str) -> RequeueResult:
     telemetry = setup_observability(settings)
     client = redis_client(settings, socket_timeout=5.0)
     repo, pool = build_repository(settings)
     try:
         use_case = RequeueFromDlq(
-            dlq=build_queue(settings, client, consumer_name(settings)),
+            dlq=build_queue(settings, client, CLI_CONSUMER),
             repository=repo,
             clock=SystemClock(),
         )
@@ -264,15 +309,70 @@ def requeue(settings: Settings, reference: str, *, operator: str, reason: str) -
         flush_logs()
 
 
+def drain_dlq(
+    settings: Settings,
+    filters: DrainFilters,
+    *,
+    execute: bool,
+    operator: str,
+    reason: str,
+    limit: int | None,
+    batch_size: int,
+    pause_seconds: float,
+    sample_size: int,
+) -> DrainReport:
+    telemetry = setup_observability(settings)
+    client = redis_client(settings, socket_timeout=5.0)
+    repo, pool = build_repository(settings)
+    should_stop = ShouldStop()
+    install_signal_handlers(should_stop)  # Ctrl+C termina el lote en curso y sale limpio
+    try:
+        queue = build_queue(settings, client, CLI_CONSUMER)
+        use_case = DrainDlq(
+            dlq=queue,
+            requeue=RequeueFromDlq(dlq=queue, repository=repo, clock=SystemClock()),
+            sleep=InterruptibleSleeper(should_stop).sleep,
+        )
+        return use_case.run(
+            filters,
+            execute=execute,
+            operator=operator,
+            reason=reason,
+            limit=limit,
+            batch_size=batch_size,
+            pause_seconds=pause_seconds,
+            sample_size=sample_size,
+        )
+    finally:
+        pool.close()
+        client.close()
+        telemetry.shutdown()
+        flush_logs()
+
+
+def request_stop(settings: Settings, *, ttl_seconds: int | None, clear: bool) -> float | bool:
+    """``rpa-worker stop``: crea la llave (valor = hora de Redis, TTL obligatorio) o la borra."""
+    client = redis_client(settings, socket_timeout=5.0)
+    try:
+        queue = build_queue(settings, client, CLI_CONSUMER)
+        if clear:
+            return queue.clear_stop()
+        if ttl_seconds is None:
+            raise ValueError("--ttl es obligatorio")
+        return queue.request_stop(ttl_seconds)
+    finally:
+        client.close()
+
+
 def seed(settings: Settings, post_ids: Sequence[str], *, priority: str) -> list[Transaction]:
     """Encola items de prueba. Quien encola genera correlation_id y traceparent."""
     telemetry = setup_observability(settings)
     client = redis_client(settings, socket_timeout=5.0)
-    queue = build_queue(settings, client, consumer_name(settings))
+    queue = build_queue(settings, client, CLI_CONSUMER)
     tracer = trace.get_tracer("rpa_worker.seed")
     published: list[Transaction] = []
     try:
-        queue.prepare()
+        queue.ensure_groups()
         for raw_id in post_ids:
             reference = f"post-{raw_id}-{uuid.uuid4().hex[:8]}"
             correlation_id = str(uuid.uuid4())
@@ -289,7 +389,7 @@ def seed(settings: Settings, post_ids: Sequence[str], *, priority: str) -> list[
                     payload=payload,
                     correlation_id=correlation_id,
                     traceparent=carrier.get("traceparent"),
-                    enqueued_at=time.time(),
+                    first_enqueued_at=time.time(),
                 )
                 message_id = queue.publish(tx)
             log.info(

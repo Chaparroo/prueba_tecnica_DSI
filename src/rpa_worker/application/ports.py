@@ -112,6 +112,15 @@ class DlqEntry:
     transaction: Transaction
     reason: str
     last_error: str | None
+    failed_at: float | None = None  # epoch (s) en que entró al DLQ
+
+
+@dataclass(frozen=True, slots=True)
+class UnparseableDlqEntry:
+    """Entrada del DLQ sin reference legible: se reporta, nunca se reencola."""
+
+    entry_id: str
+    reason: str
 
 
 class DeadLetterStore(Protocol):
@@ -123,6 +132,14 @@ class DeadLetterStore(Protocol):
 
         El XDEL es la puerta: con dos operadores a la vez solo uno encola.
         """
+
+    def last_entry_id(self) -> str | None:
+        """Id de la entrada más reciente (tope fijo para un recorrido)."""
+
+    def scan(
+        self, *, after: str | None, until: str, count: int
+    ) -> list[DlqEntry | UnparseableDlqEntry]:
+        """Entradas con id en (after, until], en orden, como máximo ``count``."""
 
 
 class RequeueRepository(Protocol):

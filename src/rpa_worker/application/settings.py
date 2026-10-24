@@ -14,8 +14,13 @@ class ProcessingSettings:
     max_retry_after_seconds: float = 10.0
     item_retry_base_seconds: float = 30.0
     max_retry_delay_seconds: float = 3_600.0
-    # ready_at corto para items devueltos sin procesar (ShouldStop, Postgres caído).
+    # Liberación (ShouldStop, Postgres caído): ready_at = base * 2^release_count,
+    # topado en max_release_delay_seconds.
     release_delay_seconds: float = 5.0
+    max_release_delay_seconds: float = 300.0
+    # Tope por antigüedad de un item que se libera una y otra vez: al superarlo
+    # va al DLQ con reason=max_age.
+    max_item_age_seconds: float = 86_400.0
     max_deliveries: int = 5
 
 

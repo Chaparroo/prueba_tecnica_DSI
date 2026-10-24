@@ -18,7 +18,8 @@ from enum import StrEnum
 class AlertKind(StrEnum):
     AUTH = "auth"  # credenciales/permisos: 401, 403
     CONTRACT = "contract"  # la API o la BD no aceptan lo que enviamos o devuelven otra cosa
-    POISON = "poison"  # el item agotó max_deliveries (tumba al worker o dispara un bug)
+    POISON = "poison"  # max_deliveries (tumba al worker o dispara un bug) o mensaje ilegible
+    MAX_AGE = "max_age"  # superó max_item_age liberándose por fallos transitorios
 
 
 class TransactionError(Exception):

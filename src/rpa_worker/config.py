@@ -90,6 +90,9 @@ class QueueSettings(_Strict):
     # XAUTOCLAIM reclama de a UN item (COUNT 1), solo cuando el worker va a
     # procesarlo; entre revisiones sin hallazgos espera este intervalo.
     claim_interval_ms: Annotated[int, Field(ge=100)] = 15_000
+    # Al arrancar se borran (XGROUP DELCONSUMER) los consumers con 0 pendientes
+    # y sin actividad durante más de estas horas. Nunca uno con pendientes.
+    stale_consumer_hours: PositiveFloat = 24.0
 
     @model_validator(mode="after")
     def _unique_priorities(self) -> Self:
@@ -113,13 +116,19 @@ class WorkerSettings(_Strict):
     item_retry_base_seconds: PositiveFloat = 30.0
     # Tope absoluto de cualquier ready_at (backoff de item o Retry-After largo).
     max_retry_delay_seconds: PositiveFloat = 3_600.0
-    # ready_at corto para items devueltos sin procesar (ShouldStop durante un
-    # backoff, fallo transitorio de Postgres). No consume MaxRetryNumber.
+    # Items devueltos sin procesar (ShouldStop durante un backoff, fallo
+    # transitorio de Postgres). No consume MaxRetryNumber. Liberaciones por
+    # fallo: ready_at = base * 2^release_count, topado en max_release_delay.
     release_delay_seconds: PositiveFloat = 5.0
+    max_release_delay_seconds: PositiveFloat = 300.0
+    # Un item que se libera una y otra vez va al DLQ (reason=max_age) al
+    # superar esta antigüedad desde su primer encolado.
+    max_item_age_seconds: PositiveFloat = 86_400.0
     # Guarda contra mensajes venenosos: entregas (XAUTOCLAIM incluidas) tras las
     # cuales el item va al DLQ aunque Postgres no permita registrar el estado.
     max_deliveries: Annotated[int, Field(ge=2)] = 5
-    # None -> se usa HOSTNAME (id del contenedor), único por réplica.
+    # Nombre del consumer en el grupo. Prioridad: env CONSUMER_NAME, esta llave,
+    # HOSTNAME. Debe ser estable entre despliegues y ÚNICO por proceso.
     consumer_name: str | None = None
 
     @model_validator(mode="after")
@@ -127,6 +136,14 @@ class WorkerSettings(_Strict):
         if self.item_retry_base_seconds > self.max_retry_delay_seconds:
             raise ValueError(
                 "worker.item_retry_base_seconds no puede superar worker.max_retry_delay_seconds"
+            )
+        if self.release_delay_seconds > self.max_release_delay_seconds:
+            raise ValueError(
+                "worker.release_delay_seconds no puede superar worker.max_release_delay_seconds"
+            )
+        if self.max_item_age_seconds <= self.max_release_delay_seconds:
+            raise ValueError(
+                "worker.max_item_age_seconds debe superar worker.max_release_delay_seconds"
             )
         return self
 

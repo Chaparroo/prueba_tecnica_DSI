@@ -152,8 +152,10 @@ def test_redis_stop_key_mid_item_persists_it_and_takes_no_other(
     queue.publish(make_tx("REF-E2", 2))
     api = FakeApi()
 
+    operator = make_queue(redis_client, keys, "cli")
+
     def operator_sets_stop_key(_id: int) -> None:
-        redis_client.set("control:should_stop", "1", ex=60)  # llega a mitad del item
+        operator.request_stop(ttl_seconds=60)  # `rpa-worker stop`, a mitad del item
 
     api.on_call = operator_sets_stop_key
 
