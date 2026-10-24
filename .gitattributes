@@ -1,0 +1,3 @@
+# LF en el repo para todo el texto (los archivos van a contenedores Linux).
+* text=auto eol=lf
+*.png binary

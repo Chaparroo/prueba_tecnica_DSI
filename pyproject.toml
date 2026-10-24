@@ -1,0 +1,114 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rpa-worker"
+version = "0.1.0"
+description = "Worker de automatización estilo REFramework: Redis Streams -> API externa -> Postgres."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = "MIT"
+authors = [{ name = "Felipe Lopez" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Typing :: Typed",
+]
+dependencies = [
+    # Observabilidad: versiones pineadas por requisito de seguridad.
+    "opentelemetry-api==1.45.1",
+    "opentelemetry-sdk==1.45.1",
+    "opentelemetry-exporter-otlp-proto-http==1.45.1",
+    "structlog==26.1.0",
+    # Infraestructura
+    "redis>=8.1,<9",
+    "httpx>=0.28.1,<0.29",
+    "psycopg[binary]>=3.3,<3.4",
+    "psycopg-pool>=3.3,<3.4",
+    "alembic>=1.20,<2",
+    # Configuración
+    "pydantic>=2.14,<3",
+    "pyyaml>=6.0.3,<7",
+]
+
+[project.scripts]
+rpa-worker = "rpa_worker.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+    "ruff==0.17.2",
+    "mypy==2.4.0",
+    "types-pyyaml>=6.0.12",
+    "testcontainers[redis,postgres]==4.15.0",
+    "pre-commit>=4.7,<5",
+    "pip-audit>=2.10,<3",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rpa_worker"]
+
+# ----------------------------------------------------------------- ruff
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F",   # pycodestyle / pyflakes
+    "I",             # isort
+    "B",             # bugbear
+    "UP",            # pyupgrade
+    "N",             # pep8-naming
+    "S",             # bandit (seguridad)
+    "BLE",           # except Exception ciego
+    "RUF",
+    "SIM",
+    "PT",            # estilo pytest
+    "TID",           # imports prohibidos (frontera hexagonal)
+]
+# BusinessException / SystemException son nombres de REFramework (requisito).
+ignore = ["N818"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106"]  # assert y contraseñas de prueba
+# Solo adaptadores, composition root e integración tocan infraestructura.
+"src/rpa_worker/adapters/**" = ["TID251"]
+"src/rpa_worker/bootstrap.py" = ["TID251"]
+"src/rpa_worker/cli.py" = ["TID251"]
+"migrations/**" = ["TID251"]
+"tests/integration/**" = ["TID251"]
+"tests/unit/test_http_api.py" = ["TID251"]  # prueba del adaptador HTTP
+
+# El dominio y la aplicación no pueden importar infraestructura.
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"redis".msg = "Infraestructura: solo permitido en rpa_worker.adapters"
+"httpx".msg = "Infraestructura: solo permitido en rpa_worker.adapters"
+"psycopg".msg = "Infraestructura: solo permitido en rpa_worker.adapters"
+"psycopg_pool".msg = "Infraestructura: solo permitido en rpa_worker.adapters"
+
+[tool.ruff.format]
+quote-style = "double"
+
+# ----------------------------------------------------------------- mypy
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+packages = ["rpa_worker", "tests"]
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["testcontainers.*", "docker.*"]
+ignore_missing_imports = true
+
+# ----------------------------------------------------------------- pytest
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+markers = [
+    "integration: requiere Docker (testcontainers); se omite si Docker no está disponible",
+]
